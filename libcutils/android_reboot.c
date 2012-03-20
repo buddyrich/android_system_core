@@ -25,10 +25,17 @@
 
 #include <cutils/android_reboot.h>
 
+/* SafeStrap trigger file; chose /cache as it is available from
+ * both /system and /systemorig and avoids issues trying to write
+ * to the filesystem during the execution of the reboot binary
+ * without the proper root permissions */
+#define SS_FILE     "/cache/.ss"
+
+static FILE* ssfd;
+
 /* Check to see if /proc/mounts contains any writeable filesystems
  * backed by a block device.
- * Return true if none found, else return false.
- */
+ * Return true if none found, else return false. */
 static int remount_ro_done(void)
 {
     FILE *f;
@@ -101,28 +108,36 @@ static void remount_ro(void)
     return;
 }
 
-
 int android_reboot(int cmd, int flags, char *arg)
 {
     int ret = 0;
     int reason = -1;
 
+/* Want to make sure we don't force all the partitions readonly 
+ * before writing to our trigger file; hopefully, this won't
+ * cause any issues in terms of rebooting without syncing.
+ * Note that this only kicks in if ANDROID_RB_RESTART2 is sent
+ * as the internal reason code (cmd) for the restart; this only
+ * applies when a reboot into recovery/bootloader is requested.*/ 
 #ifdef RECOVERY_PRE_COMMAND
     if (cmd == (int) ANDROID_RB_RESTART2) {
-        if (arg && strlen(arg) > 0) {
-            char cmd[PATH_MAX];
-            sprintf(cmd, RECOVERY_PRE_COMMAND " %s", arg);
-            system(cmd);
+        if (arg && strlen(arg) > 0) { 
+            flags = ANDROID_RB_FLAG_NO_SYNC | ANDROID_RB_FLAG_NO_REMOUNT_RO;
+            char r_cmd[PATH_MAX];
+	    sprintf(r_cmd, RECOVERY_PRE_COMMAND);
+	    system(r_cmd);
         }
-    }
+    } 
 #endif
 
     if (!(flags & ANDROID_RB_FLAG_NO_SYNC))
-        sync();
+	sync();
 
     if (!(flags & ANDROID_RB_FLAG_NO_REMOUNT_RO))
-        remount_ro();
-
+        remount_ro(); 
+    
+    /* Checking the internal reboot reason code and deciding 
+     * what to do. */
     switch (cmd) {
         case ANDROID_RB_RESTART:
             reason = RB_AUTOBOOT;
@@ -130,6 +145,7 @@ int android_reboot(int cmd, int flags, char *arg)
 
         case ANDROID_RB_POWEROFF:
             ret = reboot(RB_POWER_OFF);
+	    //ret = __reboot(LINUX_REBOOT_MAGIC1, LINUX_REBOOT_MAGIC2, LINUX_REBOOT_CMD_POWER_OFF, NULL);
             return ret;
 
         case ANDROID_RB_RESTART2:
@@ -140,16 +156,71 @@ int android_reboot(int cmd, int flags, char *arg)
             return -1;
     }
 
+/* Want to clear the reason to RB_AUTOBOOT so that the kernel
+ * performs a regular reboot instead of trying to initiate a
+ * reboot into the stock recovery/bootloader */
 #ifdef RECOVERY_PRE_COMMAND_CLEAR_REASON
     reason = RB_AUTOBOOT;
 #endif
+    
+    int ro_poll_cnt = 0;
 
-    if (reason != -1)
-        ret = reboot(reason);
-    else
-        ret = __reboot(LINUX_REBOOT_MAGIC1, LINUX_REBOOT_MAGIC2,
-                           LINUX_REBOOT_CMD_RESTART2, arg);
+    if (reason != -1) { 
+	
+	/* Doubtful that there'd be any reason to pass in an argument
+	 * of more than 64 characters, but if that happens there'll
+ 	 * just be a segmentation fault */
+	char *r_arg = (char *)calloc(strlen("0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF"), sizeof(char));     
+	
+	/* If there's no argument then perform a normal reboot */
+	if ((arg) && strlen(arg) > 0) {
+		strcpy(r_arg,arg);
+	} else {
+		ret = reboot(reason);
+	}
+        
+	/* If the reboot reason passed in from the OS was the string
+         * "recovery", then skip the system call (__reboot) and
+	 * perform a normal reboot after marking the recovery trigger
+	 * file at /cache/.ss */
+	if( !(strcmp(r_arg,"recovery")) ) {
+		
+		ssfd = fopen(SS_FILE, "w");
+                fwrite("1\n", sizeof(char), 2, ssfd);
+                fclose(ssfd);
+		sync();
+		
+        	ret = reboot(reason);
 
-    return ret;
+	/* If the reason sent in was "bp-tools", then reboot directly
+	 * into the stock recovery.  (ie: /system/bin/reboot bp-tools)
+	 * note the system call to __reboot, if we sent "bp-tools" as
+	 * the reason, the kernel simply performs an ordinary reboot */
+	} else if( !(strcmp(r_arg,"bp-tools")) ) {
+		
+		ssfd = fopen(SS_FILE, "w");
+                fwrite("0\n", sizeof(char), 2, ssfd);
+                fclose(ssfd);
+		sync();
+		
+		char reboot_arg[strlen("recovery")];
+		sprintf(reboot_arg, "recovery" );	
+		ret = __reboot(LINUX_REBOOT_MAGIC1, LINUX_REBOOT_MAGIC2, LINUX_REBOOT_CMD_RESTART2, reboot_arg);
+	
+	/* Self-explanatory */
+	} else if( !(strcmp(r_arg,"bootloader")) ) {
+		
+		ssfd = fopen(SS_FILE, "w");
+                fwrite("0\n", sizeof(char), 2, ssfd);
+                fclose(ssfd);
+		sync();
+		
+		char reboot_arg[strlen("bootloader")];
+		sprintf(reboot_arg, "bootloader" );	
+		ret = __reboot(LINUX_REBOOT_MAGIC1, LINUX_REBOOT_MAGIC2, LINUX_REBOOT_CMD_RESTART2, reboot_arg);
+	
+	}
+     } 
+ 
+     return ret;
 }
-
